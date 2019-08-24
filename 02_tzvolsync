@@ -1,0 +1,290 @@
+#!/bin/bash
+# vim: sw=5
+###########################################################################
+#
+#       Program name:   tzvolsync
+#       File name:      tzvolsync.sh
+#       Author:         Peter Blajev
+#       First revision: 12/20/2010
+#
+#       Description:
+#         Sends incr. ZFS data streams to a remote backup system.
+#
+#       Designed to be ran from cron:
+#       0,30 * * * 1,3,5,0 /usr/local/sbin/tzvolsync run >> /var/log/tzvolsync.log 2>&1
+#       15,45 * * * 2,4,6 /usr/local/sbin/tzvolsync run >> /var/log/tzvolsync.log 2>&
+#
+###########################################################################
+
+# ---------------------------------------------------------------------------
+# Things we can setup
+
+# USER that should be used to connect to the remote system
+USER=zfshelp
+
+# How many snapshots to keep
+TOKEEP=3
+
+# Config file
+configFile="/usr/local/etc/tzvolsync.conf"
+
+# ---------------------------------------------------------------------------
+# Do not edit below this line
+
+# Tailored for Solaris
+PATH="/usr/gnu/bin:/usr/bin:/bin:/usr/X11/bin:/usr/sbin:/sbin"
+
+HOSTNAME=`hostname`
+self="`basename $0`"
+
+myid=`id -u`
+myname=`id -un`
+
+# ===========================================================================
+# START the INITIAL Run of the recursive sequence
+# ===========================================================================
+if [ "$1" == "run" ]; then
+     # This is the initial run
+
+     # Is root the one who ran tzvolsync?
+     if [ $myid -ne 0 ]; then
+	  echo "
+     ${self}:
+	     Must be run as root (uid=0).
+	     You are currently $myname (uid=$myid).
+     "
+	  exit 1
+     fi
+
+     # Make sure no other process is running
+     RUNFILE=/var/run/$self.pid
+
+     if [ -f $RUNFILE ]; then
+	  echo "(`date +%H:%M:%S`) Old $self is running. PID in $RUNFILE: \
+	       `cat $RUNFILE`"
+	  exit 1
+     fi
+
+     # Save the process ID.
+     echo $$ > $RUNFILE
+
+     # Parse the config file
+     if [ ! -r $configFile ]; then
+	  echo "${self}: Config file $configFile not found."
+	  rm -f $RUNFILE
+	  exit 1
+     fi
+
+     cat $configFile | \
+	  grep -v "^\#" | \
+	  grep -v "^ " | \
+	  grep -v "^$" |
+     while read configLine; do
+	  MASTER=`echo $configLine | awk -F "|" '{print $1}'`
+	  VOLUME=`echo $configLine | awk -F "|" '{print $2}'`
+	  SLAVE=`echo $configLine | awk -F "|" '{print $3}'`
+
+	  if [ "$MASTER" != "$HOSTNAME" ]; then
+	       # this entry is not for us
+	       continue
+	  fi
+
+	  # run recursive
+	  $0 $MASTER $VOLUME $SLAVE
+     done
+
+     rm -f $RUNFILE
+
+     echo ""
+     echo "--------------------------------------------------------------------"
+     echo "==> [`date +\"%m/%d/%Y - %H:%M\"`] Done"
+
+     exit 0
+fi
+# ===========================================================================
+# END the INITIAL Run of the recursive sequence
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Make sure the system is good to run the command
+goodtogo ()
+{
+EXITSTAT=0
+
+# Did we get a dataset
+[ "$2" == "" ] && EXITSTAT=1
+
+# Is the DATASETIN a ZFS pool?
+POOLS=`zpool list       \
+     | grep -v NAME     \
+     | awk '{print $1}'`
+
+for POOL in $POOLS; do
+     [ "$2" == "$POOL" ] && EXITSTAT=2
+done
+
+# Does the FS exit?
+zfs list $2 > /dev/null 2>&1
+[ $? -ne 0 ] && EXITSTAT=3
+
+# Did we get a slave server
+[ "$3" == "" ] && EXITSTAT=4
+
+# Is the slave server running any replication at this time?
+ISRUNNING=`ssh -n $USER@$3 ps -ef | grep -E 'zfs send|zfs receive' | grep -v grep`
+[ -n "$ISRUNNING" ] && EXITSTAT=5
+
+echo $EXITSTAT
+
+} # END goodtogo
+
+# ---------------------------------------------------------------------------
+# START main program
+# ---------------------------------------------------------------------------
+
+MASTER=$1
+VOLUME=$2
+SLAVE=$3
+
+
+echo ""
+echo "--------------------------------------------------------------------"
+echo "==> [`date +\"%m/%d/%Y - %H:%M\"`] $MASTER:$VOLUME -> $SLAVE"
+
+case `goodtogo $MASTER $VOLUME $SLAVE` in
+1)
+     echo ""
+     echo "    ERROR: Dataset empty."
+     exit 1
+     ;;
+2)
+     echo ""
+     echo "    ERROR: Looks like $VOLUME is a pool."
+     exit 1
+     ;;
+3)
+     echo ""
+     echo "    ERROR: ZFS dataset $VOLUME is invalid."
+     exit 1
+     ;;
+4)
+     echo ""
+     echo "    ERROR: Destination host not set."
+     exit 1
+     ;;
+5)
+     echo ""
+     echo "    ERROR: Process \"zfs [send,receive]\" found on $SLAVE"
+     exit 1
+     ;;
+esac
+
+# At this point we are ready to start replication
+
+# ---------------------------------------------------------------------------
+# Find the last snapshots on both servers
+LASTSNAP=`zfs list -r -t snapshot -o name $VOLUME | \
+     grep $VOLUME@$self | tail -1 | tr '@' ' ' | awk '{print \$2}'`
+
+if [ "$LASTSNAP" == "" ]; then
+     echo ""
+     echo "    No old snapshots for $VOLUME. Running for the first time."
+     INCREMENTAL=no
+
+     # There should be no dataset existing on the remote server
+     ssh -n $USER@$SLAVE "sudo /usr/sbin/zfs list $VOLUME" > /dev/null 2>&1
+     if [ $? -eq 0 ]; then
+	  echo "    ERROR: Dataset $VOLUME exists on the remote server."
+	  echo "    Destroy it first and then rerun $self."
+	  exit 1
+     fi
+else
+     # Make sure the snapshot exists on the slave
+     LASTRSNAP=`ssh -n $USER@$SLAVE "sudo /usr/sbin/zfs list -r -t snapshot -o name $VOLUME 2>&1 | grep $VOLUME@$self" | \
+	  tail -1 | tr '@' ' ' | awk '{print $2}'`
+     if [ "$LASTSNAP" == "$LASTRSNAP" ]; then
+	  echo "    Last snapshot $VOLUME@$LASTSNAP"
+	  echo "    found on both hosts."
+	  INCREMENTAL=yes
+     else
+	  echo "    Snapshot $VOLUME@$LASTSNAP not found or"
+	  echo "    not the most recent on the remote server."
+	  exit 1
+     fi
+fi
+
+# ---------------------------------------------------------------------------
+# New snapshot
+
+NEWSNAP=`date +$self%Y%m%d%H%M`
+if [ "$NEWSNAP" == "$LASTSNAP" ]; then
+     echo "   Snapshot $NEWSNAP exists. Wait at least 1 min. between runs."
+     exit 1
+fi
+
+CMD="zfs snapshot $VOLUME@$NEWSNAP"
+echo ""
+#echo "    (`date +%H:%M:%S`) New snapshot"
+echo "    (`date +%H:%M:%S`) New snapshot: $VOLUME@$NEWSNAP"
+echo "      Run: $CMD"
+
+$CMD
+
+if [ $? -ne 0 ]; then
+     echo "    ERROR: Creating sanpshot failed."
+     exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Send data stream to the slave
+
+CMDOPT=""
+ROPT=""
+
+[ "$INCREMENTAL" == "yes" ] && CMDOPT="-i $VOLUME@$LASTSNAP"
+
+CMD="zfs send $CMDOPT $VOLUME@$NEWSNAP | ssh $USER@$SLAVE 'sudo /usr/sbin/zfs receive $ROPT $VOLUME'"
+
+echo ""
+echo "    (`date +%H:%M:%S`) Sending data to the slave"
+echo "      Run: $CMD"
+
+echo $CMD | bash
+
+if [ $? -ne 0 ]; then
+     echo "    Something went wrong. Removing the snapshot."
+     zfs destroy $VOLUME@$NEWSNAP
+else
+     # Set ReadOnly flag on the remote dataset
+     [ "$INCREMENTAL" == "no" ] \
+	  && ssh -n $USER@$SLAVE "sudo /usr/sbin/zfs set readonly=on $VOLUME"
+fi
+
+# ---------------------------------------------------------------------------
+# Remove old snapshots
+
+NUMSNAPS=`zfs list -r -t snapshot -H -o name $VOLUME | \
+	  grep $VOLUME@$self | wc -l`
+
+NUMTODEL=`expr $NUMSNAPS - $TOKEEP`
+
+echo ""
+echo "    (`date +%H:%M:%S`) Removing old snapshots"
+
+if [ $NUMTODEL -lt 1 ]; then
+     echo "    No snapshots to delete."
+else
+     SNAPSTODEL=`zfs list -r -t snapshot -H -o name $VOLUME | \
+	  grep $VOLUME@$self | head -${NUMTODEL}`
+
+     echo "    Removing: $SNAPSTODEL"
+
+     for SNAP in $SNAPSTODEL; do
+	  zfs destroy $SNAP
+	  ssh -n $USER@$SLAVE "sudo /usr/sbin/zfs destroy $SNAP"
+     done
+fi
+
+# ---------------------------------------------------------------------------
+
+exit 0

@@ -1,0 +1,87 @@
+#!/bin/bash
+# vim: sw=5
+
+svnRepos="/svn/photometria /svn/sysadmin /svn/passwords /svn/consultants"
+#svnRepos="/svn/sysadmin"
+
+emailTo="sysreports@myCompany.com"
+toKeep=5
+
+SELF=`basename $0`
+
+tempF=`mktemp -q -p /tmp $SELF.XXXXXXXX`
+backupDir="/data/netBackups/svn"
+
+while [ $# -ne 0 ]; do
+    case $1 in
+    "-h")
+        host=$2
+        shift 2
+        ;;
+    "-u")
+        user=$2
+        shift 2
+        ;;
+    *)
+        echo "$0 ERROR: Unknown option $1"
+        exit 1
+        ;;
+    esac
+done
+
+if [ ! -n "$host" ] || [ ! -n "$user" ]; then
+    echo "USAGE: $0 -h host -u user"
+    rm -f $tempF
+    exit 1
+fi
+
+rotateBackup ()
+{
+     dirFiles=`ssh $user@$host ls -t $backupDir/${1}-*`
+     countFiles=`echo $dirFiles | tr ' ' '\n' | wc -l`
+     if [ $countFiles -gt $toKeep ]; then
+	  toDelete=`expr $countFiles - $toKeep`
+	  deleteFiles=`echo $dirFiles | tr ' ' '\n' | tail -$toDelete`
+     fi
+     ssh $user@$host rm -f $deleteFiles
+}
+
+runDump ()
+{
+for repo in $svnRepos; do
+     repoName="`basename $repo`"
+     backupF="${repoName}-`date +%Y%m%d-%H%M%S`"
+     CMD="svnadmin dump $repo | \
+	  ssh $user@$host 'cat > $backupDir/$backupF'"
+
+     echo "==> [`date +\"%m/%d/%Y - %H:%M:%S\"`] START: $repo svn dump" \
+	  >> $tempF
+
+     echo $CMD | bash > /dev/null 2>&1
+
+     if [ $? -ne 0 ]; then
+	  echo "    ERROR: Backup failed" >> $tempF
+	  EXITSTAT=2
+     else
+	  echo "    Successful dump to $host:$backupDir/$backupF" \
+	       >> $tempF
+	  rotateBackup $repoName
+     fi
+done
+
+echo "==> [`date +\"%m/%d/%Y - %H:%M:%S\"`] END" >> $tempF
+
+[ "$EXITSTAT" = "2" ] && SUBJECT="ERROR:"
+
+SUBJECT="$SUBJECT Subversion Backup Report"
+
+echo $SUBJECT
+
+}
+
+SUBJECT="`runDump`"
+
+cat $tempF | mail -s "$SUBJECT" $emailTo
+
+rm -f $tempF
+exit 0

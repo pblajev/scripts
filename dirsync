@@ -1,0 +1,102 @@
+#!/bin/bash
+# vim: sw=5
+###########################################################################
+#
+#       Program name:   dirsync
+#       File name:      dirsync.sh
+#       Author:         Peter Blajev
+#       First revision: 06/17/2012
+#
+#       Description:
+#         Rsyncs local directories.
+#
+###########################################################################
+
+emailTO="sysreports@myCompany.com"
+
+PATH="/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+self="`basename $0`"
+
+# Uncomment this line for debugging
+#set -x
+
+HOSTNAME=`hostname | sed 's/\..*//'`
+
+USAGE="NO"
+
+# Use some files
+tempFile="/tmp/${self}.run-`date +%Y%m%d`-$$"
+
+# Directory to exclude
+EXCLUDE="--exclude '*.backup' --exclude '*.writing'"
+
+# Collect some parametters
+#
+
+sDir=$1
+if [ ! -n "$sDir" ] || [ ! -d $sDir ]; then
+     echo "ERROR: Directory $sDir doesn't exit."
+     USAGE="YES"
+fi
+
+dDir=$2
+if [ ! -n "$dDir" ] || [ ! -d $dDir ]; then
+     echo "ERROR: Directory $dDir doesn't exit."
+     USAGE="YES"
+fi
+
+shouldRun=$3
+if [ -n "$shouldRun" ] && [ "$shouldRun" != "run" ]; then
+     USAGE=YES
+fi
+
+if [ "$USAGE" = "YES" ]; then
+     echo "
+${self}:
+Usage:	$self sourceDirectory destinationDirectory [run]
+
+     The command will show what commands will be run to synchronize the
+     directories.
+     Add "run" at the end to excecute the commands.
+
+     NOTE: When in "run" mode the output will be sent via email.
+"
+     exit 1
+fi
+
+emailTemp ()
+{
+     cat $tempFile | mail -s "$1" $emailTO
+     rm -f $tempFile
+}
+
+blogIt ()
+{
+     if [ "$shouldRun" == "run" ]; then
+	  echo $1 >> $tempFile
+     else
+	  echo $1
+     fi
+}
+
+# ---------------------------------------------------------------------------
+# All looking good. Build the command
+
+subject="$HOSTNAME:$self report"
+
+CMD="rsync -aH --stats $EXCLUDE --delete $sDir $dDir"
+
+blogIt "=== [`date +%D\ -\ %T`] Starting $self on $HOSTNAME ==="
+blogIt "$CMD"
+
+if [ "$shouldRun" == "run" ]; then
+     echo $CMD | /bin/bash >> $tempFile 2>&1
+     [ $? -ne 0 ] && subject="ERROR: ${subject}"
+fi
+
+blogIt "=== [`date +%D\ -\ %T`] END $self on $HOSTNAME ==="
+
+[ "$shouldRun" == "run" ] && emailTemp "$subject"
+
+exit 0

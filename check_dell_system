@@ -1,0 +1,173 @@
+#!/bin/bash
+#
+# PBB - 8/1/2008
+
+PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:/opt/dell/srvadmin/bin
+
+PROGNAME=`basename $0`
+
+TMPFILE=`mktemp -q -p /tmp/ $PROGNAME.XXXXXXXX`
+MSG=""
+
+print_usage() {
+  echo "Usage: $PROGNAME"
+}
+
+print_help() {
+  echo ""
+  print_usage
+  echo ""
+  echo "This plugin checks Dell PowerEdge systems using Dell's OpenManage."
+  echo ""
+  exit 0
+}
+
+case "$1" in
+  --help)
+    print_help
+    exit 0
+    ;;
+  -h)
+    print_help
+    exit 0
+    ;;
+esac
+
+reset_values()
+{
+PART_STATUS=""
+PART_NAME=""
+PART_STATE=""
+FAILURE=""
+}
+
+OMREPORT=`which omreport 2> /dev/null`
+if [ ! -x "$OMREPORT" ]; then
+    echo "$PROGNAME: Cannot find omreport" >&2
+    exit 1
+fi
+
+# Is OpenManage working (not just running)
+# ---------------------------------------------------------------------------
+
+# keep in mind that we use $controllers later in the script
+controllers=`$OMREPORT storage controller | \
+                grep -e '^ID' | awk '{ print $3 }'`
+if [ "$controllers" = "" ]; then
+    echo "OpenManage services not running!!!"
+    exit 2
+fi
+
+
+components="chassis storage"
+
+for component in $components; do
+
+     case $component in
+     "chassis") 
+	  $OMREPORT $component | \
+	       grep "^.*\:.*$" | grep -v "^SEVERITY" > $TMPFILE
+
+	  while read line; do
+	       STATUS=`echo $line | awk '{print $1}'`
+	       PART=`echo $line | awk '{print $3}'`
+	       case $STATUS in
+	       "Ok")
+		    MSG_BODY=""
+		    MSG_DETAILS=""
+		    ;;
+	       "Critical")
+		    MSG_BODY="$STATUS - $PART"
+		    MSG_DETAILS=""
+		    SEVERITY_CR=1
+		    ;;
+	       "Warning")
+		    MSG_BODY="$STATUS - $PART"
+		    MSG_DETAILS=""
+		    SEVERITY_W=1
+		    ;;
+	       *)
+		    MSG_BODY="$STATUS - $PART"
+		    MSG_DETAILS="(Unknown Status)"
+		    SEVERITY_CR=1
+		    ;;
+	       esac
+	       [ -n "$MSG_BODY" ] && MSG="$MSG $MSG_BODY $MSG_DETAILS;"
+	  done < $TMPFILE
+	  ;;
+
+     "storage")
+	  for index in $controllers; do
+	       $OMREPORT $component controller controller=$index > $TMPFILE
+	       while read line; do
+		    if [ -n "$line" ]; then
+
+			 echo $line | grep "^Status" > /dev/null
+			 [ $? -eq 0 ] && PART_STATUS=`echo $line | sed -e 's/^.* : //'`
+
+			 echo $line | grep "^Name" > /dev/null
+			 [ $? -eq 0 ] && PART_NAME=`echo $line |  sed -e 's/^.* : //'`
+
+			 echo $line | grep "^State" > /dev/null
+			 [ $? -eq 0 ] && PART_STATE=`echo $line | sed -e 's/^.* : //'`
+
+			 echo $line | grep "^Failure Predicted" > /dev/null
+			 [ $? -eq 0 ] && FAILURE=`echo $line | awk -F ":" '{print $2}'`
+
+		    else
+			 # Reached the end of part details
+
+			 # Is the status OK?
+			 case $PART_STATUS in
+			 "Ok")
+			      MSG_BODY=""
+			      MSG_DETAILS=""
+			      ;;
+			 "Critical")
+			      MSG_BODY="$PART_STATUS - $PART_NAME $PART_STATE"
+			      MSG_DETAILS=""
+			      SEVERITY_CR=1
+			      ;;
+			 "Warning")
+			      MSG_BODY="$PART_STATUS - $PART_NAME $PART_STATE"
+			      MSG_DETAILS=""
+			      SEVERITY_W=1
+			      ;;
+			 "Non-Critical")
+			      MSG_BODY="$PART_STATUS - $PART_NAME $PART_STATE"
+			      [ "$FAILURE" = " Yes" ] && MSG_DETAILS="(Failure Predicted:Yes)"
+			      SEVERITY_W=1
+			      ;;
+			 "")
+			      MSG_BODY=""
+			      MSG_DETAILS=""
+			      echo "Seems like this is the last line" > /dev/null
+			      ;;
+			 *)
+			      MSG_BODY="$PART_STATUS - $PART_NAME $PART_STATE"
+			      MSG_DETAILS="(Unknown Status)"
+			      SEVERITY_CR=1
+			      ;;
+			 esac
+			 [ -n "$MSG_BODY" ] && MSG="$MSG $MSG_BODY $MSG_DETAILS;"
+			 reset_values
+		    fi
+	       done < $TMPFILE
+	  done # if index in $controllers
+	  ;;
+     esac
+
+done
+
+rm -f $TMPFILE
+
+if [ "$SEVERITY_CR" = "1" ]; then
+    echo "$MSG"
+    exit 2
+elif [ "$SEVERITY_W" = "1" ]; then
+    echo "$MSG"
+    exit 1
+else
+    echo "System Health - OK"
+    exit 0
+fi

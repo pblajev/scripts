@@ -1,0 +1,90 @@
+#!/bin/bash
+# vim: sw=5
+
+gitRepoDir="/repos"
+
+# File list pattern to be excluded from backup.
+# That means /repos/gitplay.git and /whatever/gitplay.git will be excluded.
+# If you add /whatever/directory/gitplay.git in the INCLUDE list it will
+# NOT be backed.
+EXCLUDE="--exclude=lost+found \
+	--exclude=gitplay.git"
+
+# Path to repositories that are not in gitRepoDir
+# NOTE: The name should not match anything in EXCLUDE or it will not be bakced
+# 	regardless the path.
+#
+#INCLUDE="/repos/myCompany-testing"
+INCLUDE=""
+
+emailTo="sysreports@myCompany.com"
+toKeep=5
+
+SELF=`basename $0`
+
+tempF=`mktemp -q -p /tmp $SELF.XXXXXXXX`
+
+backupF="git-`date +%Y%m%d-%H%M%S`.tgz"
+backupDir="/data/netBackups/git"
+
+while [ $# -ne 0 ]; do
+    case $1 in
+    "-h")
+	host=$2
+	shift 2
+	;;
+    "-u")
+	user=$2
+	shift 2
+	;;
+    *)
+	echo "$0 ERROR: Unknown option $1"
+	exit 1
+	;;
+    esac
+done
+
+if [ ! -n "$host" ] || [ ! -n "$user" ]; then
+    echo "USAGE: $0 -h host -u user"
+    rm -f $tempF
+    exit 1
+fi
+
+rotateBackup ()
+{
+     dirFiles=`ssh $user@$host ls -t $backupDir/git-*`
+     countFiles=`echo $dirFiles | tr ' ' '\n' | wc -l`
+     if [ $countFiles -gt $toKeep ]; then
+	  toDelete=`expr $countFiles - $toKeep`
+	  deleteFiles=`echo $dirFiles | tr ' ' '\n' | tail -$toDelete`
+     fi
+     echo "     Deleting Backups: $deleteFiles" >> $tempF
+     ssh $user@$host rm -f $deleteFiles
+}
+
+echo "==> [`date +\"%m/%d/%Y - %H:%M:%S\"`] START: Git repos backup" >> $tempF
+
+tar zcf - $EXCLUDE $INCLUDE $gitRepoDir \
+     | ssh $user@$host "( cat > $backupDir/$backupF )" \
+     >> $tempF 2>&1
+
+if [ $? -ne 0 ]; then
+     echo "    ERROR: Backup failed" >> $tempF
+     EXITSTAT=2
+else
+     echo "    Successful backup to $host:$backupDir/$backupF" \
+	  >> $tempF
+     rotateBackup
+fi
+
+echo "==> [`date +\"%m/%d/%Y - %H:%M:%S\"`] END" >> $tempF
+
+[ "$EXITSTAT" = "2" ] && SUBJECT="ERROR:"
+
+SUBJECT="$SUBJECT GIT Backup Report"
+
+cat $tempF | mail -s "$SUBJECT" $emailTo
+
+rm -f $tempF
+exit 0
+
